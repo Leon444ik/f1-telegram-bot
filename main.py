@@ -4,7 +4,7 @@ import sqlite3
 import os
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from deep_translator import GoogleTranslator
 from aiohttp import web
@@ -21,32 +21,33 @@ translator = GoogleTranslator(source='en', target='ru')
 # Множество для хранения ID отправленных инцидентов
 sent_incidents = set()
 
-# Кэш переводов
-translation_cache = {}
-
-# Быстрый локальный словарь основных флагов и команд FIA
-F1_DICTIONARY = {
-    "SAFETY CAR DEPLOYED": "Выведена машина безопасности (Safety Car)",
-    "VIRTUAL SAFETY CAR DEPLOYED": "Введён режим виртуальной машины безопасности (VSC)",
-    "SAFETY CAR IN THIS LAP": "Машина безопасности уходит на этом круге",
-    "VIRTUAL SAFETY CAR ENDING": "Режим VSC завершается",
-    "YELLOW FLAG": "Жёлтые флаги на трассе",
-    "RED FLAG": "Красные флаги (Сессия остановлена)",
-    "GREEN FLAG": "Зелёные флаги (Трасса чиста)",
-    "DRS ENABLED": "Система DRS разрешена",
-    "DRS DISABLED": "Система DRS запрещена",
-    "CHEQUERED FLAG": "Клетчатый флаг (Финиш)",
-}
-
 # --- 1. БАЗА ДАННЫХ SQLite ---
 def init_db():
     conn = sqlite3.connect("f1_bot.db")
     cursor = conn.cursor()
+    # Таблица пользователей
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT
+        )
+    """)
+    # Таблица личного зачёта пилотов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS driver_standings (
+            position INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            team TEXT,
+            points REAL
+        )
+    """)
+    # Таблица Кубка конструкторов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS constructor_standings (
+            position INTEGER PRIMARY KEY,
+            team_name TEXT UNIQUE,
+            points REAL
         )
     """)
     conn.commit()
@@ -70,7 +71,40 @@ def get_all_users():
     conn.close()
     return [u[0] for u in users]
 
-# --- 2. МЕНЮ И КЛАВИАТУРЫ ---
+# --- 2. УПРАВЛЕНИЕ ЗАЧЁТОМ В БД ---
+def update_driver_points(name_query: str, points: float):
+    conn = sqlite3.connect("f1_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM driver_standings WHERE name LIKE ?", (f"%{name_query}%",))
+    row = cursor.fetchone()
+    if row:
+        real_name = row[0]
+        cursor.execute("UPDATE driver_standings SET points = ? WHERE name = ?", (points, real_name))
+    else:
+        cursor.execute("INSERT INTO driver_standings (name, team, points) VALUES (?, ?, ?)", (name_query, "F1 Team", points))
+    
+    # Пересчитываем позиции по очкам
+    cursor.execute("SELECT id, points FROM driver_standings ORDER BY points DESC")
+    conn.commit()
+    conn.close()
+
+def get_db_driver_standings():
+    conn = sqlite3.connect("f1_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, team, points FROM driver_standings ORDER BY points DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def get_db_constructor_standings():
+    conn = sqlite3.connect("f1_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT team_name, points FROM constructor_standings ORDER BY points DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+# --- 3. МЕНЮ И КЛАВИАТУРЫ ---
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="📊 Личный зачёт")
@@ -84,24 +118,19 @@ def get_refresh_inline_keyboard(action: str):
     builder.button(text="🔄 Обновить данные", callback_data=f"refresh_{action}")
     return builder.as_markup()
 
-# --- 3. УМНЫЙ ПЕРЕВОДЧИК СООБЩЕНИЙ FIA ---
+# --- 4. УМНЫЙ ПЕРЕВОДЧИК СООБЩЕНИЙ FIA ---
 def translate_f1_message(text: str) -> str:
-    """Мгновенный и надежный переводчик сообщений FIA"""
     if not text:
         return ""
-    
     t = text.upper().strip()
-    
     if "DOUBLE YELLOW IN" in t:
         sector = t.split("IN")[-1].replace("TRACK", "").strip()
         return f"Двойные жёлтые флаги ({sector})"
     if "YELLOW IN" in t:
         sector = t.split("IN")[-1].replace("TRACK", "").strip()
         return f"Жёлтые флаги ({sector})"
-        
     if "GREEN IN" in t or "GREEN FLAG" in t:
         return "Зелёные флаги — трасса свободна"
-        
     if "SAFETY CAR DEPLOYED" in t:
         return "Выведена машина безопасности (Safety Car)"
     if "VIRTUAL SAFETY CAR DEPLOYED" in t:
@@ -114,18 +143,25 @@ def translate_f1_message(text: str) -> str:
         return "Система DRS разрешена"
     if "DRS DISABLED" in t:
         return "Система DRS запрещена"
-        
     if "INCIDENT INVOLVING CAR" in t and "NOTED" in t:
         car = t.split("CAR")[-1].split("NOTED")[0].strip()
         return f"Зафиксирован инцидент с машиной #{car}"
     if "INCIDENT INVOLVING CAR" in t and "UNDER INVESTIGATION" in t:
         car = t.split("CAR")[-1].split("UNDER INVESTIGATION")[0].strip()
         return f"Инцидент с машиной #{car} расследуется стюардами"
-        
     return text
 
-# --- 4. ПОЛУЧЕНИЕ ДАННЫХ ИЗ API ---
+# --- 5. ПОЛУЧЕНИЕ ДАННЫХ (БД + API) ---
 async def get_driver_standings():
+    db_rows = get_db_driver_standings()
+    if db_rows:
+        text = "📊 **Личный зачёт пилотов:**\n\n"
+        for idx, (name, team, points) in enumerate(db_rows[:15], 1):
+            pts_str = int(points) if points == int(points) else points
+            text += f"{idx}. **{name}** ({team}) — {pts_str} очк.\n"
+        return text
+
+    # Фоллбэк на API, если БД пустая
     url = "https://api.jolpi.ca/ergast/f1/current/driverstandings.json"
     try:
         async with aiohttp.ClientSession() as session:
@@ -137,7 +173,7 @@ async def get_driver_standings():
                         return "⚠️ Данные о личном зачёте недоступны."
                     
                     standings = standings_list[0]['DriverStandings']
-                    text = "📊 **Личный зачёт пилотов:**\n\n"
+                    text = "📊 **Личный зачёт пилотов (API):**\n\n"
                     for driver in standings[:10]:
                         pos = driver['position']
                         name = f"{driver['Driver']['givenName']} {driver['Driver']['familyName']}"
@@ -151,6 +187,14 @@ async def get_driver_standings():
         return "⚠️ Произошла ошибка при загрузке данных."
 
 async def get_constructor_standings():
+    db_rows = get_db_constructor_standings()
+    if db_rows:
+        text = "🏎️ **Кубок конструкторов:**\n\n"
+        for idx, (team, points) in enumerate(db_rows, 1):
+            pts_str = int(points) if points == int(points) else points
+            text += f"{idx}. **{team}** — {pts_str} очк.\n"
+        return text
+
     url = "https://api.jolpi.ca/ergast/f1/current/constructorstandings.json"
     try:
         async with aiohttp.ClientSession() as session:
@@ -162,7 +206,7 @@ async def get_constructor_standings():
                         return "⚠️ Данные о Кубке конструкторов недоступны."
                     
                     standings = standings_list[0]['ConstructorStandings']
-                    text = "🏎️ **Кубок конструкторов:**\n\n"
+                    text = "🏎️ **Кубок конструкторов (API):**\n\n"
                     for team in standings:
                         pos = team['position']
                         name = team['Constructor']['name']
@@ -201,7 +245,6 @@ async def get_full_weekend_schedule():
 
                     text = f"🏁 **{race_name}**\n📍 Трасса: {circuit} ({locality}, {country})\n\n"
                     text += "⏱️ **Расписание сессий (Время МСК):**\n"
-                    
                     if 'FirstPractice' in race:
                         text += f"🏎️ Практика 1: **{to_msk(race['FirstPractice']['date'], race['FirstPractice'].get('time'))}**\n"
                     if 'SecondPractice' in race:
@@ -210,7 +253,6 @@ async def get_full_weekend_schedule():
                         text += f"🏎️ Практика 3: **{to_msk(race['ThirdPractice']['date'], race['ThirdPractice'].get('time'))}**\n"
                     if 'Qualifying' in race:
                         text += f"⏱️ Квалификация: **{to_msk(race['Qualifying']['date'], race['Qualifying'].get('time'))}**\n"
-                    
                     text += f"🏆 **Гонка:** **{to_msk(race['date'], race.get('time'))}**\n"
                     return text
                 return "⚠️ Не удалось получить расписание."
@@ -218,11 +260,9 @@ async def get_full_weekend_schedule():
         print(f"Ошибка API (Schedule): {e}")
         return "⚠️ Произошла ошибка при загрузке расписания."
 
-# --- 5. ТРЕКЕР ПРОИСШЕСТВИЙ С АВТОПЕРЕВОДОМ ---
+# --- 6. ТРЕКЕР ПРОИСШЕСТВИЙ С АВТОПЕРЕВОДОМ ---
 async def track_live_incidents():
-    """Отслеживает происшествия и переводит сообщения FIA на русский язык"""
     url = "https://api.openf1.org/v1/race_control?session_key=latest"
-    
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -231,7 +271,6 @@ async def track_live_incidents():
                         messages = await response.json()
                         for msg in messages[-5:]:
                             msg_id = f"{msg.get('date')}_{msg.get('message')}"
-                            
                             if msg_id not in sent_incidents:
                                 category = msg.get('category', '').upper()
                                 flag = msg.get('flag', '')
@@ -260,23 +299,37 @@ async def track_live_incidents():
                                             await bot.send_message(user_id, alert_text, parse_mode="Markdown")
                                         except Exception:
                                             pass
-                                            
                                     sent_incidents.add(msg_id)
         except Exception as e:
             print(f"Ошибка фонового трекера: {e}")
             
         await asyncio.sleep(20)
 
-# --- 6. ОБРАБОТЧИКИ TELEGRAM ---
+# --- 7. ОБРАБОТЧИКИ TELEGRAM И АДМИН-КОМАНДЫ ---
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
     add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await message.answer(
         f"Привет, {message.from_user.first_name}! 🏎️\n"
         "Добро пожаловать в бот Формулы-1.\n"
-        "Бот автоматически отслеживает происшествия на трассе и переводит их на русский язык!",
+        "Бот автоматически отслеживает происшествия на трассе и показывает результаты!",
         reply_markup=get_main_keyboard()
     )
+
+@dp.message(Command("set_driver"))
+async def cmd_set_driver(message: types.Message):
+    # Команда формата: /set_driver Имя Очки
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.answer("⚠️ Формат: `/set_driver Имя Очки`\nПример: `/set_driver Antonelli 325`", parse_mode="Markdown")
+        return
+    name = args[1]
+    try:
+        pts = float(args[2])
+        update_driver_points(name, pts)
+        await message.answer(f"✅ Очки пилота **{name}** успешно обновлены до **{pts}**!", parse_mode="Markdown")
+    except ValueError:
+        await message.answer("⚠️ Очки должны быть числом!")
 
 @dp.message(lambda message: message.text == "📊 Личный зачёт")
 async def btn_driver_standings(message: types.Message):
@@ -317,7 +370,7 @@ async def process_refresh(callback: types.CallbackQuery):
     except Exception:
         pass
 
-# --- 7. ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА (СЛУШАЕТ ПОРТ) ---
+# --- 8. ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА (СЛУШАЕТ ПОРТ) ---
 async def handle_ping(request):
     return web.Response(text="F1 Telegram Bot is alive and running!")
 
@@ -331,7 +384,7 @@ async def start_web_server():
     await site.start()
     print(f"Веб-сервер запущен на порту {port}")
 
-# --- 8. ГЛАВНЫЙ ЗАПУСК ---
+# --- 9. ГЛАВНЫЙ ЗАПУСК ---
 async def main():
     init_db()
     await start_web_server()
