@@ -1,14 +1,15 @@
 import asyncio
 import aiohttp
 import sqlite3
+import os
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from deep_translator import GoogleTranslator
+from aiohttp import web
 
-import os
-
+# Получаем токен из переменных окружения Render
 TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
@@ -20,7 +21,7 @@ translator = GoogleTranslator(source='en', target='ru')
 # Множество для хранения ID отправленных инцидентов
 sent_incidents = set()
 
-# Кэш переводов, чтобы не отправлять повторные запросы в Google
+# Кэш переводов
 translation_cache = {}
 
 # Быстрый локальный словарь основных флагов и команд FIA
@@ -85,13 +86,12 @@ def get_refresh_inline_keyboard(action: str):
 
 # --- 3. УМНЫЙ ПЕРЕВОДЧИК СООБЩЕНИЙ FIA ---
 def translate_f1_message(text: str) -> str:
-    """Мгновенный и надежный переводчик сообщений FIA без зависимости от внешних серверов"""
+    """Мгновенный и надежный переводчик сообщений FIA"""
     if not text:
         return ""
     
     t = text.upper().strip()
     
-    # 1. Желтые и двойные желтые флаги по секторам
     if "DOUBLE YELLOW IN" in t:
         sector = t.split("IN")[-1].replace("TRACK", "").strip()
         return f"Двойные жёлтые флаги ({sector})"
@@ -99,11 +99,9 @@ def translate_f1_message(text: str) -> str:
         sector = t.split("IN")[-1].replace("TRACK", "").strip()
         return f"Жёлтые флаги ({sector})"
         
-    # 2. Зеленые флаги
     if "GREEN IN" in t or "GREEN FLAG" in t:
         return "Зелёные флаги — трасса свободна"
         
-    # 3. Базовые события
     if "SAFETY CAR DEPLOYED" in t:
         return "Выведена машина безопасности (Safety Car)"
     if "VIRTUAL SAFETY CAR DEPLOYED" in t:
@@ -117,7 +115,6 @@ def translate_f1_message(text: str) -> str:
     if "DRS DISABLED" in t:
         return "Система DRS запрещена"
         
-    # 4. Расследования и инциденты
     if "INCIDENT INVOLVING CAR" in t and "NOTED" in t:
         car = t.split("CAR")[-1].split("NOTED")[0].strip()
         return f"Зафиксирован инцидент с машиной #{car}"
@@ -125,8 +122,33 @@ def translate_f1_message(text: str) -> str:
         car = t.split("CAR")[-1].split("UNDER INVESTIGATION")[0].strip()
         return f"Инцидент с машиной #{car} расследуется стюардами"
         
-    # Если попалось редкое сообщение, выводим понятную структурированную форму
     return text
+
+# --- 4. ПОЛУЧЕНИЕ ДАННЫХ ИЗ API ---
+async def get_driver_standings():
+    url = "https://api.jolpi.ca/ergast/f1/current/driverstandings.json"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    standings_list = data['MRData']['StandingsTable']['StandingsLists']
+                    if not standings_list:
+                        return "⚠️ Данные о личном зачёте недоступны."
+                    
+                    standings = standings_list[0]['DriverStandings']
+                    text = "📊 **Личный зачёт пилотов:**\n\n"
+                    for driver in standings[:10]:
+                        pos = driver['position']
+                        name = f"{driver['Driver']['givenName']} {driver['Driver']['familyName']}"
+                        points = driver['points']
+                        team = driver['Constructors'][0]['name'] if driver.get('Constructors') else ""
+                        text += f"{pos}. **{name}** ({team}) — {points} очк.\n"
+                    return text
+                return "⚠️ Не удалось получить данные о зачёте пилотов."
+    except Exception as e:
+        print(f"Ошибка API (Drivers): {e}")
+        return "⚠️ Произошла ошибка при загрузке данных."
 
 async def get_constructor_standings():
     url = "https://api.jolpi.ca/ergast/f1/current/constructorstandings.json"
@@ -196,7 +218,7 @@ async def get_full_weekend_schedule():
         print(f"Ошибка API (Schedule): {e}")
         return "⚠️ Произошла ошибка при загрузке расписания."
 
-# --- 5. ТРЕКЕР ПРОИСШЕСТВИЙ С АВТОПЕРЕВОДОМ (OpenF1 API) ---
+# --- 5. ТРЕКЕР ПРОИСШЕСТВИЙ С АВТОПЕРЕВОДОМ ---
 async def track_live_incidents():
     """Отслеживает происшествия и переводит сообщения FIA на русский язык"""
     url = "https://api.openf1.org/v1/race_control?session_key=latest"
@@ -295,11 +317,27 @@ async def process_refresh(callback: types.CallbackQuery):
     except Exception:
         pass
 
+# --- 7. ВЕБ-СЕРВЕР ДЛЯ РЕНДЕРА (СЛУШАЕТ ПОРТ) ---
+async def handle_ping(request):
+    return web.Response(text="F1 Telegram Bot is alive and running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Веб-сервер запущен на порту {port}")
+
+# --- 8. ГЛАВНЫЙ ЗАПУСК ---
 async def main():
     init_db()
+    await start_web_server()
     asyncio.create_task(track_live_incidents())
-    print("Бот успешно запущен (с защитой перевода от ошибок)...")
+    print("Бот и веб-сервер успешно запущены!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
