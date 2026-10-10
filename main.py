@@ -7,7 +7,9 @@ from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from deep_translator import GoogleTranslator
 
-TOKEN = "8842972563:AAGlbL2nO3ijkIuQm2JLtjjg7EwxsHNBeoU"
+import os
+
+TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
